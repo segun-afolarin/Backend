@@ -15,10 +15,10 @@ COPY . .
 
 RUN composer install --no-dev --optimize-autoloader
 
-RUN cp .env.example .env || true
+RUN if [ ! -f .env ]; then cp .env.example .env; fi
 
 RUN php artisan key:generate --force || true
 
 EXPOSE 10000
 
-CMD php artisan serve --host=0.0.0.0 --port=10000
+CMD php artisan config:clear && php artisan serve --host=0.0.0.0 --port=10000
