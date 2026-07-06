@@ -6,6 +6,7 @@ use App\Http\Controllers\Auth\RegisterController;
 use App\Http\Controllers\LocationController;
 use App\Http\Controllers\NotificationController;
 use App\Http\Controllers\ProfileController;
+use App\Http\Controllers\ReportController;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\RateLimiter;
 use Illuminate\Support\Facades\Route;
@@ -53,6 +54,13 @@ Route::middleware(['auth:sanctum'])->group(function () {
     Route::patch('/notifications/read-all',   [NotificationController::class, 'markAllRead']);
     Route::patch('/notifications/{id}/read',  [NotificationController::class, 'markRead']);
     Route::delete('/notifications/{id}',      [NotificationController::class, 'destroy']);
+
+    // Reports — called by report-related pages (My Reports, Confirmed, Nearby, submission, confirmation)
+    Route::get('/reports/mine',                [ReportController::class, 'mine']);
+    Route::get('/reports/confirmed',           [ReportController::class, 'confirmed']);
+    Route::get('/reports/nearby',              [ReportController::class, 'nearby']);
+    Route::post('/reports',                    [ReportController::class, 'store']);
+    Route::post('/reports/{report}/confirm',   [ReportController::class, 'confirm']);
 
     // Returns the full fresh user object — called on every page load
     // by AuthContext to keep all components in sync with the database.
