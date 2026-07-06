@@ -142,6 +142,11 @@ class ReportController extends Controller
                     'country'     => $user->country ?? 'Nigeria',
                     'latitude'    => $validated['latitude'] ?? $user->latitude,
                     'longitude'   => $validated['longitude'] ?? $user->longitude,
+                    // Explicitly set — Eloquent's create() only reflects attributes
+                    // passed in, not DB-level column defaults, so leaving this out
+                    // meant $report->status was null in memory immediately after
+                    // create() even though the DB row correctly defaulted to 'pending'.
+                    'status'      => 'pending',
                     'images'      => $paths,
                 ]);
             });
