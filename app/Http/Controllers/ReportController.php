@@ -377,7 +377,11 @@ class ReportController extends Controller
             'location'              => $r->address,
             'status'                => $this->statusLabel($r->status),
             'date'                  => $r->created_at->format('d F Y'),
+            // ISO timestamp so the frontend can compute a live "x mins ago" label
+            // without re-parsing the human-readable `date` string above.
+            'createdAt'             => $r->created_at->toIso8601String(),
             'score'                 => $r->ai_score . '%',
+            'category'              => $r->category,
             'confirmations'         => $r->confirmations_count ?? $r->confirmations()->count(),
             'requiredConfirmations' => $r->required_confirmations,
             'image'                 => $r->image_urls[0] ?? null,
