@@ -8,6 +8,7 @@ use App\Models\User;
 use Illuminate\Http\Request;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Storage;
 use Illuminate\Validation\ValidationException;
@@ -54,7 +55,6 @@ class ReportController extends Controller
 
     /**
      * Community reports near the authenticated user, matched by state.
-     * This is the "you're in Abuja, you see Abuja reports" feed.
      * GET /api/reports/nearby
      */
     public function nearby(Request $request): JsonResponse
@@ -104,6 +104,17 @@ class ReportController extends Controller
             'images'      => ['required', 'array', 'min:1', 'max:3'],
             'images.*'    => ['image', 'mimes:jpg,jpeg,png,webp', 'max:5120'],
         ]);
+
+        // ── AI verification: does the photo evidence match the selected category? ──
+        $verification = $this->verifyImagesMatchCategory($validated['category'], $request->file('images'));
+
+        if (!$verification['matches']) {
+            return response()->json([
+                'message'     => $verification['reason']
+                    ?: "The uploaded photo(s) don't appear to match \"{$validated['category']}\". Please upload a clearer photo of the actual incident.",
+                'ai_mismatch' => true,
+            ], 422);
+        }
 
         try {
             $report = DB::transaction(function () use ($request, $user, $validated) {
@@ -172,6 +183,17 @@ class ReportController extends Controller
             return response()->json(['message' => 'You already confirmed this report.'], 409);
         }
 
+        // ── AI verification for confirmation evidence too ──
+        $verification = $this->verifyImagesMatchCategory($report->category, [$request->file('evidence')]);
+
+        if (!$verification['matches']) {
+            return response()->json([
+                'message'     => $verification['reason']
+                    ?: "The uploaded photo doesn't appear to match this report's category (\"{$report->category}\"). Please upload clearer evidence.",
+                'ai_mismatch' => true,
+            ], 422);
+        }
+
         try {
             $confirmation = DB::transaction(function () use ($request, $report, $user) {
                 $path = $request->file('evidence')->store('confirmations', 'public');
@@ -205,7 +227,97 @@ class ReportController extends Controller
         ], 201);
     }
 
-    // ── Transformers — shape data exactly as the ReportGrid / ReportFormPanel expect ──
+    /**
+     * Ask OpenAI's vision model whether the uploaded photo(s) plausibly
+     * match the selected incident category. Fails "open" (allows the
+     * report through) if the API key is missing or OpenAI is unreachable,
+     * so a billing issue or outage never blocks legitimate emergency reports.
+     */
+    private function verifyImagesMatchCategory(string $category, array $files): array
+    {
+        $apiKey = config('services.openai.key');
+
+        if (!$apiKey) {
+            return ['matches' => true, 'reason' => 'AI verification not configured.'];
+        }
+
+        $imageContents = [];
+        foreach ($files as $file) {
+            if (!$file) {
+                continue;
+            }
+            $base64 = base64_encode(file_get_contents($file->getRealPath()));
+            $mime   = $file->getMimeType();
+            $imageContents[] = [
+                'type'      => 'image_url',
+                'image_url' => ['url' => "data:{$mime};base64,{$base64}"],
+            ];
+        }
+
+        if (empty($imageContents)) {
+            return ['matches' => true, 'reason' => 'No images to verify.'];
+        }
+
+        $prompt = "You are verifying a civic incident report submitted in Nigeria. "
+            . "The reporter selected this incident category: \"{$category}\". "
+            . "Look at the attached photo(s) and judge whether they plausibly show "
+            . "evidence of this type of incident (categories include: Flooding, Bad Roads, "
+            . "Drain Blockage, Power Failure, Fire Outbreak, Accident). "
+            . "Be reasonably lenient — approve if the photo could plausibly relate to the category, "
+            . "even if not perfectly clear. Only reject if the photo is obviously unrelated "
+            . "(e.g. a selfie, a meme, a completely different scene). "
+            . "Respond ONLY with strict JSON, no other text, no markdown: "
+            . '{"matches": true or false, "reason": "short one-sentence explanation a citizen would understand"}';
+
+        try {
+            $response = Http::withToken($apiKey)
+                ->timeout(30)
+                ->post('https://api.openai.com/v1/chat/completions', [
+                    'model' => 'gpt-4o-mini',
+                    'messages' => [
+                        [
+                            'role' => 'user',
+                            'content' => array_merge(
+                                [['type' => 'text', 'text' => $prompt]],
+                                $imageContents
+                            ),
+                        ],
+                    ],
+                    'max_tokens' => 200,
+                ]);
+
+            if (!$response->successful()) {
+                Log::error('OpenAI verification failed', [
+                    'status' => $response->status(),
+                    'body'   => $response->body(),
+                ]);
+                return ['matches' => true, 'reason' => 'AI verification unavailable.'];
+            }
+
+            $content = $response->json('choices.0.message.content');
+
+            // Strip markdown code fences if the model wraps its JSON in them
+            $content = trim(preg_replace('/^```(?:json)?|```$/m', '', $content ?? ''));
+
+            $parsed = json_decode($content, true);
+
+            if (!is_array($parsed)) {
+                Log::warning('Could not parse OpenAI response', ['content' => $content]);
+                return ['matches' => true, 'reason' => 'Could not parse AI response.'];
+            }
+
+            return [
+                'matches' => (bool) ($parsed['matches'] ?? true),
+                'reason'  => $parsed['reason'] ?? '',
+            ];
+
+        } catch (\Throwable $e) {
+            Log::error('OpenAI request threw exception', ['message' => $e->getMessage()]);
+            return ['matches' => true, 'reason' => 'AI verification unavailable.'];
+        }
+    }
+
+    // ── Transformers ──────────────────────────────────────────────────────
 
     private function transformOwnReport(Report $r): array
     {
