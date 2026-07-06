@@ -127,8 +127,6 @@ class ReportController extends Controller
                     'title'       => $validated['title'],
                     'description' => $validated['description'],
                     'address'     => $validated['address'],
-                    // Location is inherited from the reporter's profile so it
-                    // automatically lands in the right state-based feed
                     'state'       => $user->state,
                     'country'     => $user->country ?? 'Nigeria',
                     'latitude'    => $validated['latitude'] ?? $user->latitude,
@@ -250,7 +248,6 @@ class ReportController extends Controller
             ],
             'fields'      => $this->deriveFields($r),
             'updates'     => $this->deriveUpdates($r->status),
-            // The photo evidence the current user personally uploaded when confirming
             'myEvidence'  => $c->evidence_url,
         ];
     }
@@ -258,25 +255,25 @@ class ReportController extends Controller
     private function transformNearbyReport(Report $r, array $confirmedByMeIds): array
     {
         return [
-            'id'                 => $r->reference_code,
-            'title'              => $r->title,
-            'location'           => $r->address,
-            'status'             => $this->statusLabel($r->status),
-            'date'               => $r->created_at->format('d F Y'),
-            'score'              => $r->ai_score . '%',
-            'confirmations'      => $r->confirmations_count ?? $r->confirmations()->count(),
+            'id'                    => $r->reference_code,
+            'title'                 => $r->title,
+            'location'              => $r->address,
+            'status'                => $this->statusLabel($r->status),
+            'date'                  => $r->created_at->format('d F Y'),
+            'score'                 => $r->ai_score . '%',
+            'confirmations'         => $r->confirmations_count ?? $r->confirmations()->count(),
             'requiredConfirmations' => $r->required_confirmations,
-            'image'              => $r->image_urls[0] ?? null,
-            'description'        => $r->description,
-            'fields'             => $this->deriveFields($r),
-            'updates'            => $this->deriveUpdates($r->status),
-            'submittedBy'        => ['name' => $r->user->name, 'avatar' => $r->user->avatar],
-            'confirmedByMe'      => in_array($r->id, $confirmedByMeIds, true),
-            'confirmedBy'        => $r->confirmations->map(fn ($c) => [
+            'image'                 => $r->image_urls[0] ?? null,
+            'description'           => $r->description,
+            'fields'                => $this->deriveFields($r),
+            'updates'               => $this->deriveUpdates($r->status),
+            'submittedBy'           => ['name' => $r->user->name, 'avatar' => $r->user->avatar],
+            'confirmedByMe'         => in_array($r->id, $confirmedByMeIds, true),
+            'confirmedBy'           => $r->confirmations->map(fn ($c) => [
                 'name'   => $c->user->name,
                 'avatar' => $c->user->avatar,
             ])->values()->all(),
-            'reportId'           => $r->id, // raw id, needed to call POST /reports/{id}/confirm
+            'reportId'              => $r->id,
         ];
     }
 
