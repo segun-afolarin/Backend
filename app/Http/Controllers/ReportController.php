@@ -372,6 +372,8 @@ class ReportController extends Controller
     private function transformNearbyReport(Report $r, array $confirmedByMeIds): array
     {
         return [
+            // Human-readable label (e.g. "NR-2041") for display — the numeric
+            // `reportId` below is the actual PK used for the confirm endpoint.
             'id'                    => $r->reference_code,
             'title'                 => $r->title,
             'location'              => $r->address,
