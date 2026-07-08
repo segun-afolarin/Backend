@@ -16,6 +16,153 @@ use Illuminate\Validation\ValidationException;
 class ReportController extends Controller
 {
     /**
+     * Aggregate, state-scoped dashboard stats: total/resolved/pending report
+     * counts, week-over-week growth for each, a 7-day daily trend for the
+     * activity chart, and the most-reported category this week.
+     * GET /api/reports/stats
+     */
+    public function stats(Request $request): JsonResponse
+    {
+        $user = $request->user();
+
+        if (!$user->state) {
+            return response()->json([
+                'state'                => null,
+                'totalReports'         => 0,
+                'totalGrowth'          => 0,
+                'activeLocations'      => 0,
+                'resolved'             => 0,
+                'resolvedGrowth'       => 0,
+                'pending'              => 0,
+                'pendingGrowth'        => 0,
+                'awaitingVerification' => 0,
+                'inProgress'           => 0,
+                'verified'             => 0,
+                'verifiedGrowth'       => 0,
+                'avgResponseHours'     => null,
+                'totalConfirmations'   => 0,
+                'activeVerifiers'      => 0,
+                'weeklyTrend'          => array_fill(0, 7, 0),
+                'topCategory'          => null,
+                'todayTotal'           => 0,
+                'todayByCategory'      => (object) [],
+            ]);
+        }
+
+        $base = Report::inState($user->state);
+
+        // Today's totals, scoped to the user's own state — matches every
+        // other figure on this response instead of going nationwide.
+        $todayTotal = (clone $base)->whereDate('created_at', now()->toDateString())->count();
+
+        $todayByCategory = (clone $base)
+            ->whereDate('created_at', now()->toDateString())
+            ->select('category', DB::raw('count(*) as total'))
+            ->groupBy('category')
+            ->pluck('total', 'category');
+
+        $totalReports    = (clone $base)->count();
+        $activeLocations = (clone $base)->distinct('address')->count('address');
+        $resolved        = (clone $base)->where('status', 'resolved')->count();
+        $pending         = (clone $base)->whereIn('status', ['pending', 'in_progress'])->count();
+
+        // Split out the two "not resolved" sub-states individually:
+        // 'pending'     → still below the community-confirmation threshold.
+        // 'in_progress' → citizens have verified it, escalated to authorities,
+        //                 waiting on government action.
+        $awaitingVerification = (clone $base)->where('status', 'pending')->count();
+        $inProgress           = (clone $base)->where('status', 'in_progress')->count();
+
+        // "Verified" = reports that have passed the community-confirmation
+        // threshold and moved beyond raw 'pending' (in_progress or resolved) —
+        // distinct from 'resolved', which means government action is done.
+        $verified = (clone $base)->whereIn('status', ['in_progress', 'resolved'])->count();
+
+        $weekAgo     = now()->subDays(7);
+        $twoWeeksAgo = now()->subDays(14);
+
+        $totalGrowth    = $this->weekOverWeekGrowth(clone $base, $weekAgo, $twoWeeksAgo);
+        $resolvedGrowth = $this->weekOverWeekGrowth((clone $base)->where('status', 'resolved'), $weekAgo, $twoWeeksAgo);
+        $pendingGrowth  = $this->weekOverWeekGrowth((clone $base)->whereIn('status', ['pending', 'in_progress']), $weekAgo, $twoWeeksAgo);
+        $verifiedGrowth = $this->weekOverWeekGrowth((clone $base)->whereIn('status', ['in_progress', 'resolved']), $weekAgo, $twoWeeksAgo);
+
+        // Average hours between submission and resolution, across resolved
+        // reports only. Null (not 0) when nothing's been resolved yet, so the
+        // frontend can show "—" instead of a misleading "0h".
+        $avgResponseHours = (clone $base)
+            ->where('status', 'resolved')
+            ->selectRaw('AVG(TIMESTAMPDIFF(HOUR, created_at, updated_at)) as avg_hours')
+            ->value('avg_hours');
+        $avgResponseHours = $avgResponseHours !== null ? round((float) $avgResponseHours, 1) : null;
+
+        // Total citizen confirmations and distinct confirmers across every
+        // report in this state — powers "Citizen Confirmations" / "Active
+        // Verifiers" without needing a separate endpoint.
+        $totalConfirmations = ReportConfirmation::whereHas('report', function ($q) use ($user) {
+            $q->inState($user->state);
+        })->count();
+
+        $activeVerifiers = ReportConfirmation::whereHas('report', function ($q) use ($user) {
+            $q->inState($user->state);
+        })->distinct('user_id')->count('user_id');
+
+        // Daily counts for the last 7 days, oldest → newest, for the activity chart.
+        $weeklyTrend = [];
+        for ($i = 6; $i >= 0; $i--) {
+            $day = now()->subDays($i)->toDateString();
+            $weeklyTrend[] = (clone $base)->whereDate('created_at', $day)->count();
+        }
+
+        $topCategory = (clone $base)
+            ->where('created_at', '>=', $weekAgo)
+            ->select('category', DB::raw('count(*) as total'))
+            ->groupBy('category')
+            ->orderByDesc('total')
+            ->limit(1)
+            ->value('category');
+
+        return response()->json([
+            'state'                => $user->state,
+            'totalReports'         => $totalReports,
+            'totalGrowth'          => $totalGrowth,
+            'activeLocations'      => $activeLocations,
+            'resolved'             => $resolved,
+            'resolvedGrowth'       => $resolvedGrowth,
+            'pending'              => $pending,
+            'pendingGrowth'        => $pendingGrowth,
+            'awaitingVerification' => $awaitingVerification,
+            'inProgress'           => $inProgress,
+            'verified'             => $verified,
+            'verifiedGrowth'       => $verifiedGrowth,
+            'avgResponseHours'     => $avgResponseHours,
+            'totalConfirmations'   => $totalConfirmations,
+            'activeVerifiers'      => $activeVerifiers,
+            'weeklyTrend'      => $weeklyTrend,
+            'topCategory'      => $topCategory,
+            'todayTotal'       => $todayTotal,
+            'todayByCategory'  => $todayByCategory,
+        ]);
+    }
+
+    /**
+     * Percentage change between the trailing 7-day window and the 7 days
+     * before that. Returns 100 if there was no prior activity to compare
+     * against (avoids a division by zero reading as 0% growth), or 0 if
+     * there's been no activity in either window.
+     */
+    private function weekOverWeekGrowth($query, $weekAgo, $twoWeeksAgo): int
+    {
+        $thisWeek = (clone $query)->where('created_at', '>=', $weekAgo)->count();
+        $lastWeek = (clone $query)->whereBetween('created_at', [$twoWeeksAgo, $weekAgo])->count();
+
+        if ($lastWeek === 0) {
+            return $thisWeek > 0 ? 100 : 0;
+        }
+
+        return (int) round((($thisWeek - $lastWeek) / $lastWeek) * 100);
+    }
+
+    /**
      * Reports the authenticated user submitted.
      * GET /api/reports/mine
      */
@@ -332,6 +479,10 @@ class ReportController extends Controller
             'location'      => $r->address,
             'status'        => $this->statusLabel($r->status),
             'date'          => $r->created_at->format('d F Y'),
+            // Raw ISO timestamp alongside the formatted `date` above — lets
+            // the frontend compute real week-over-week growth without
+            // re-parsing a locale-formatted string.
+            'createdAt'     => $r->created_at->toIso8601String(),
             'score'         => $r->ai_score . '%',
             'confirmations' => $r->confirmations_count ?? $r->confirmations()->count(),
             'image'         => $r->image_urls[0] ?? null,
