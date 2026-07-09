@@ -15,10 +15,12 @@ use Illuminate\Validation\ValidationException;
 
 class ReportController extends Controller
 {
+    /** Emergency reports need fewer citizen confirmations before escalation. */
+    private const REQUIRED_CONFIRMATIONS_EMERGENCY = 3;
+    private const REQUIRED_CONFIRMATIONS_NORMAL    = 5;
+
     /**
-     * Aggregate, state-scoped dashboard stats: total/resolved/pending report
-     * counts, week-over-week growth for each, a 7-day daily trend for the
-     * activity chart, and the most-reported category this week.
+     * Aggregate, state-scoped dashboard stats.
      * GET /api/reports/stats
      */
     public function stats(Request $request): JsonResponse
@@ -51,8 +53,6 @@ class ReportController extends Controller
 
         $base = Report::inState($user->state);
 
-        // Today's totals, scoped to the user's own state — matches every
-        // other figure on this response instead of going nationwide.
         $todayTotal = (clone $base)->whereDate('created_at', now()->toDateString())->count();
 
         $todayByCategory = (clone $base)
@@ -66,17 +66,9 @@ class ReportController extends Controller
         $resolved        = (clone $base)->where('status', 'resolved')->count();
         $pending         = (clone $base)->whereIn('status', ['pending', 'in_progress'])->count();
 
-        // Split out the two "not resolved" sub-states individually:
-        // 'pending'     → still below the community-confirmation threshold.
-        // 'in_progress' → citizens have verified it, escalated to authorities,
-        //                 waiting on government action.
         $awaitingVerification = (clone $base)->where('status', 'pending')->count();
         $inProgress           = (clone $base)->where('status', 'in_progress')->count();
-
-        // "Verified" = reports that have passed the community-confirmation
-        // threshold and moved beyond raw 'pending' (in_progress or resolved) —
-        // distinct from 'resolved', which means government action is done.
-        $verified = (clone $base)->whereIn('status', ['in_progress', 'resolved'])->count();
+        $verified             = (clone $base)->whereIn('status', ['in_progress', 'resolved'])->count();
 
         $weekAgo     = now()->subDays(7);
         $twoWeeksAgo = now()->subDays(14);
@@ -86,18 +78,12 @@ class ReportController extends Controller
         $pendingGrowth  = $this->weekOverWeekGrowth((clone $base)->whereIn('status', ['pending', 'in_progress']), $weekAgo, $twoWeeksAgo);
         $verifiedGrowth = $this->weekOverWeekGrowth((clone $base)->whereIn('status', ['in_progress', 'resolved']), $weekAgo, $twoWeeksAgo);
 
-        // Average hours between submission and resolution, across resolved
-        // reports only. Null (not 0) when nothing's been resolved yet, so the
-        // frontend can show "—" instead of a misleading "0h".
         $avgResponseHours = (clone $base)
             ->where('status', 'resolved')
             ->selectRaw('AVG(TIMESTAMPDIFF(HOUR, created_at, updated_at)) as avg_hours')
             ->value('avg_hours');
         $avgResponseHours = $avgResponseHours !== null ? round((float) $avgResponseHours, 1) : null;
 
-        // Total citizen confirmations and distinct confirmers across every
-        // report in this state — powers "Citizen Confirmations" / "Active
-        // Verifiers" without needing a separate endpoint.
         $totalConfirmations = ReportConfirmation::whereHas('report', function ($q) use ($user) {
             $q->inState($user->state);
         })->count();
@@ -106,7 +92,6 @@ class ReportController extends Controller
             $q->inState($user->state);
         })->distinct('user_id')->count('user_id');
 
-        // Daily counts for the last 7 days, oldest → newest, for the activity chart.
         $weeklyTrend = [];
         for ($i = 6; $i >= 0; $i--) {
             $day = now()->subDays($i)->toDateString();
@@ -137,19 +122,13 @@ class ReportController extends Controller
             'avgResponseHours'     => $avgResponseHours,
             'totalConfirmations'   => $totalConfirmations,
             'activeVerifiers'      => $activeVerifiers,
-            'weeklyTrend'      => $weeklyTrend,
-            'topCategory'      => $topCategory,
-            'todayTotal'       => $todayTotal,
-            'todayByCategory'  => $todayByCategory,
+            'weeklyTrend'          => $weeklyTrend,
+            'topCategory'          => $topCategory,
+            'todayTotal'           => $todayTotal,
+            'todayByCategory'      => $todayByCategory,
         ]);
     }
 
-    /**
-     * Percentage change between the trailing 7-day window and the 7 days
-     * before that. Returns 100 if there was no prior activity to compare
-     * against (avoids a division by zero reading as 0% growth), or 0 if
-     * there's been no activity in either window.
-     */
     private function weekOverWeekGrowth($query, $weekAgo, $twoWeeksAgo): int
     {
         $thisWeek = (clone $query)->where('created_at', '>=', $weekAgo)->count();
@@ -182,8 +161,7 @@ class ReportController extends Controller
     }
 
     /**
-     * Reports the authenticated user has confirmed for other citizens,
-     * including the evidence photo they personally uploaded.
+     * Reports the authenticated user has confirmed for other citizens.
      * GET /api/reports/confirmed
      */
     public function confirmed(Request $request): JsonResponse
@@ -242,15 +220,20 @@ class ReportController extends Controller
         $user = $request->user();
 
         $validated = $request->validate([
-            'category'    => ['required', 'string', 'max:100'],
-            'title'       => ['required', 'string', 'max:255'],
-            'description' => ['required', 'string'],
-            'address'     => ['required', 'string', 'max:500'],
-            'latitude'    => ['nullable', 'numeric', 'between:-90,90'],
-            'longitude'   => ['nullable', 'numeric', 'between:-180,180'],
-            'images'      => ['required', 'array', 'min:1', 'max:3'],
-            'images.*'    => ['image', 'mimes:jpg,jpeg,png,webp', 'max:5120'],
+            'category'     => ['required', 'string', 'max:100'],
+            'title'        => ['required', 'string', 'max:255'],
+            'description'  => ['required', 'string'],
+            'address'      => ['required', 'string', 'max:500'],
+            'latitude'     => ['nullable', 'numeric', 'between:-90,90'],
+            'longitude'    => ['nullable', 'numeric', 'between:-180,180'],
+            'images'       => ['required', 'array', 'min:1', 'max:3'],
+            'images.*'     => ['image', 'mimes:jpg,jpeg,png,webp', 'max:5120'],
+            // Sent from the frontend as a string "true"/"false" via FormData —
+            // boolean rule with castable coerces that correctly.
+            'is_emergency' => ['nullable', 'boolean'],
         ]);
+
+        $isEmergency = filter_var($request->input('is_emergency', false), FILTER_VALIDATE_BOOLEAN);
 
         // ── AI verification: does the photo evidence match the selected category? ──
         $verification = $this->verifyImagesMatchCategory($validated['category'], $request->file('images'));
@@ -264,7 +247,7 @@ class ReportController extends Controller
         }
 
         try {
-            $report = DB::transaction(function () use ($request, $user, $validated) {
+            $report = DB::transaction(function () use ($request, $user, $validated, $isEmergency) {
                 $paths = [];
                 foreach ($request->file('images', []) as $file) {
                     if ($file->isValid()) {
@@ -280,21 +263,21 @@ class ReportController extends Controller
                 }
 
                 return Report::create([
-                    'user_id'     => $user->id,
-                    'category'    => $validated['category'],
-                    'title'       => $validated['title'],
-                    'description' => $validated['description'],
-                    'address'     => $validated['address'],
-                    'state'       => $user->state,
-                    'country'     => $user->country ?? 'Nigeria',
-                    'latitude'    => $validated['latitude'] ?? $user->latitude,
-                    'longitude'   => $validated['longitude'] ?? $user->longitude,
-                    // Explicitly set — Eloquent's create() only reflects attributes
-                    // passed in, not DB-level column defaults, so leaving this out
-                    // meant $report->status was null in memory immediately after
-                    // create() even though the DB row correctly defaulted to 'pending'.
-                    'status'      => 'pending',
-                    'images'      => $paths,
+                    'user_id'                => $user->id,
+                    'category'                => $validated['category'],
+                    'title'                   => $validated['title'],
+                    'description'             => $validated['description'],
+                    'address'                 => $validated['address'],
+                    'state'                   => $user->state,
+                    'country'                 => $user->country ?? 'Nigeria',
+                    'latitude'                => $validated['latitude'] ?? $user->latitude,
+                    'longitude'               => $validated['longitude'] ?? $user->longitude,
+                    'status'                  => 'pending',
+                    'images'                  => $paths,
+                    'is_emergency'            => $isEmergency,
+                    'required_confirmations'  => $isEmergency
+                        ? self::REQUIRED_CONFIRMATIONS_EMERGENCY
+                        : self::REQUIRED_CONFIRMATIONS_NORMAL,
                 ]);
             });
 
@@ -354,11 +337,25 @@ class ReportController extends Controller
                     throw new \RuntimeException('Evidence upload failed — storage returned no path.');
                 }
 
-                return ReportConfirmation::create([
+                $confirmation = ReportConfirmation::create([
                     'report_id'     => $report->id,
                     'user_id'       => $user->id,
                     'evidence_path' => $path,
                 ]);
+
+                // Auto-progress status once required confirmations are met —
+                // required_confirmations is already set correctly per-report
+                // (3 for emergency, 5 for normal) at creation time in store().
+                $count = $report->confirmations()->count();
+                $newStatus = $count >= $report->required_confirmations
+                    ? 'resolved'
+                    : 'in_progress';
+
+                if ($newStatus !== $report->status) {
+                    $report->update(['status' => $newStatus]);
+                }
+
+                return $confirmation;
             });
 
         } catch (\Throwable $e) {
@@ -380,33 +377,35 @@ class ReportController extends Controller
     }
 
     /**
-     * Ask OpenAI's vision model whether the uploaded photo(s) plausibly
+     * Ask Gemini's vision model whether the uploaded photo(s) plausibly
      * match the selected incident category. Fails "open" (allows the
-     * report through) if the API key is missing or OpenAI is unreachable,
-     * so a billing issue or outage never blocks legitimate emergency reports.
+     * report through) if the API key is missing or Gemini is unreachable,
+     * so a billing/outage issue never blocks legitimate emergency reports.
      */
     private function verifyImagesMatchCategory(string $category, array $files): array
     {
-        $apiKey = config('services.openai.key');
+        $apiKey = config('services.gemini.key');
 
         if (!$apiKey) {
             return ['matches' => true, 'reason' => 'AI verification not configured.'];
         }
 
-        $imageContents = [];
+        $imageParts = [];
         foreach ($files as $file) {
             if (!$file) {
                 continue;
             }
             $base64 = base64_encode(file_get_contents($file->getRealPath()));
             $mime   = $file->getMimeType();
-            $imageContents[] = [
-                'type'      => 'image_url',
-                'image_url' => ['url' => "data:{$mime};base64,{$base64}"],
+            $imageParts[] = [
+                'inline_data' => [
+                    'mime_type' => $mime,
+                    'data'      => $base64,
+                ],
             ];
         }
 
-        if (empty($imageContents)) {
+        if (empty($imageParts)) {
             return ['matches' => true, 'reason' => 'No images to verify.'];
         }
 
@@ -421,40 +420,40 @@ class ReportController extends Controller
             . "Respond ONLY with strict JSON, no other text, no markdown: "
             . '{"matches": true or false, "reason": "short one-sentence explanation a citizen would understand"}';
 
+        $parts = array_merge([['text' => $prompt]], $imageParts);
+
         try {
-            $response = Http::withToken($apiKey)
-                ->timeout(30)
-                ->post('https://api.openai.com/v1/chat/completions', [
-                    'model' => 'gpt-4o-mini',
-                    'messages' => [
-                        [
-                            'role' => 'user',
-                            'content' => array_merge(
-                                [['type' => 'text', 'text' => $prompt]],
-                                $imageContents
-                            ),
+            $response = Http::timeout(30)
+                ->post(
+                    "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={$apiKey}",
+                    [
+                        'contents' => [
+                            ['parts' => $parts],
                         ],
-                    ],
-                    'max_tokens' => 200,
-                ]);
+                        'generationConfig' => [
+                            'maxOutputTokens' => 200,
+                            'temperature'     => 0.2,
+                        ],
+                    ]
+                );
 
             if (!$response->successful()) {
-                Log::error('OpenAI verification failed', [
+                Log::error('Gemini verification failed', [
                     'status' => $response->status(),
                     'body'   => $response->body(),
                 ]);
                 return ['matches' => true, 'reason' => 'AI verification unavailable.'];
             }
 
-            $content = $response->json('choices.0.message.content');
+            $content = $response->json('candidates.0.content.parts.0.text');
 
-            // Strip markdown code fences if the model wraps its JSON in them
+            // Strip markdown code fences if Gemini wraps its JSON in them
             $content = trim(preg_replace('/^```(?:json)?|```$/m', '', $content ?? ''));
 
             $parsed = json_decode($content, true);
 
             if (!is_array($parsed)) {
-                Log::warning('Could not parse OpenAI response', ['content' => $content]);
+                Log::warning('Could not parse Gemini response', ['content' => $content]);
                 return ['matches' => true, 'reason' => 'Could not parse AI response.'];
             }
 
@@ -464,7 +463,7 @@ class ReportController extends Controller
             ];
 
         } catch (\Throwable $e) {
-            Log::error('OpenAI request threw exception', ['message' => $e->getMessage()]);
+            Log::error('Gemini request threw exception', ['message' => $e->getMessage()]);
             return ['matches' => true, 'reason' => 'AI verification unavailable.'];
         }
     }
@@ -479,12 +478,11 @@ class ReportController extends Controller
             'location'      => $r->address,
             'status'        => $this->statusLabel($r->status),
             'date'          => $r->created_at->format('d F Y'),
-            // Raw ISO timestamp alongside the formatted `date` above — lets
-            // the frontend compute real week-over-week growth without
-            // re-parsing a locale-formatted string.
             'createdAt'     => $r->created_at->toIso8601String(),
             'score'         => $r->ai_score . '%',
             'confirmations' => $r->confirmations_count ?? $r->confirmations()->count(),
+            'requiredConfirmations' => $r->required_confirmations,
+            'isEmergency'   => (bool) $r->is_emergency,
             'image'         => $r->image_urls[0] ?? null,
             'description'   => $r->description,
             'fields'        => $this->deriveFields($r),
@@ -507,6 +505,7 @@ class ReportController extends Controller
             'status'      => $this->statusLabel($r->status),
             'date'        => $r->created_at->format('d F Y'),
             'score'       => $r->ai_score . '%',
+            'isEmergency' => (bool) $r->is_emergency,
             'confirmedOn' => $c->created_at->format('d F Y'),
             'image'       => $r->image_urls[0] ?? null,
             'description' => $r->description,
@@ -523,18 +522,17 @@ class ReportController extends Controller
     private function transformNearbyReport(Report $r, array $confirmedByMeIds): array
     {
         return [
-            // Human-readable label (e.g. "NR-2041") for display — the numeric
-            // `reportId` below is the actual PK used for the confirm endpoint.
             'id'                    => $r->reference_code,
             'title'                 => $r->title,
             'location'              => $r->address,
+            'latitude'              => $r->latitude !== null ? (float) $r->latitude : null,
+            'longitude'             => $r->longitude !== null ? (float) $r->longitude : null,
             'status'                => $this->statusLabel($r->status),
             'date'                  => $r->created_at->format('d F Y'),
-            // ISO timestamp so the frontend can compute a live "x mins ago" label
-            // without re-parsing the human-readable `date` string above.
             'createdAt'             => $r->created_at->toIso8601String(),
             'score'                 => $r->ai_score . '%',
             'category'              => $r->category,
+            'isEmergency'           => (bool) $r->is_emergency,
             'confirmations'         => $r->confirmations_count ?? $r->confirmations()->count(),
             'requiredConfirmations' => $r->required_confirmations,
             'image'                 => $r->image_urls[0] ?? null,
@@ -564,6 +562,9 @@ class ReportController extends Controller
     private function deriveFields(Report $r): array
     {
         $fields = [$r->category];
+        if ($r->is_emergency) {
+            $fields[] = 'Emergency';
+        }
         if (!empty($r->images)) {
             $fields[] = 'Photo Evidence Uploaded';
         }
