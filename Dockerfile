@@ -13,6 +13,11 @@ WORKDIR /var/www
 
 COPY . .
 
+# Custom PHP settings — raises upload_max_filesize from the 2M default
+# so photo evidence uploads (up to 5MB per Laravel's validation rule)
+# actually reach Laravel instead of being silently rejected by PHP itself.
+COPY php.ini /usr/local/etc/php/conf.d/custom.ini
+
 RUN composer install --no-dev --optimize-autoloader
 
 EXPOSE 10000
