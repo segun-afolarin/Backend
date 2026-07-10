@@ -372,6 +372,46 @@ class ReportController extends Controller
     }
 
     /**
+     * Delete a report — only allowed while it's still pending (no confirmations
+     * yet, not escalated). Once a report has moved to in_progress or resolved,
+     * or has any citizen confirmations, it can no longer be deleted, to preserve
+     * the integrity of community verification history.
+     * DELETE /api/reports/{report}
+     */
+    public function destroy(Request $request, Report $report): JsonResponse
+    {
+        $user = $request->user();
+
+        if ($report->user_id !== $user->id) {
+            return response()->json(['message' => 'You can only delete your own reports.'], 403);
+        }
+
+        if ($report->status !== 'pending') {
+            return response()->json([
+                'message' => 'Only pending reports can be deleted. This report has already progressed and cannot be removed.',
+            ], 422);
+        }
+
+        // Extra safety: even if status is somehow still 'pending', block deletion
+        // if it already has confirmations (shouldn't happen given confirm() logic,
+        // but guards against any edge case or manual DB edits).
+        if ($report->confirmations()->exists()) {
+            return response()->json([
+                'message' => 'This report already has citizen confirmations and cannot be deleted.',
+            ], 422);
+        }
+
+        // Clean up stored evidence images from disk before deleting the DB row
+        foreach ($report->images ?? [] as $path) {
+            Storage::disk('public')->delete($path);
+        }
+
+        $report->delete();
+
+        return response()->json(['message' => 'Report deleted successfully.']);
+    }
+
+    /**
      * Ask Gemini's vision model whether the uploaded photo(s) plausibly
      * match the selected incident category. Fails "open" (allows the
      * report through) if the API key is missing or Gemini is unreachable,
@@ -380,16 +420,6 @@ class ReportController extends Controller
     private function verifyImagesMatchCategory(string $category, array $files): array
     {
         $apiKey = config('services.gemini.key');
-
-        // TEMPORARY DEBUG LOGGING — remove once verification is confirmed working.
-        // Tells us whether the key is reaching Laravel at all before we even
-        // attempt the API call, so we don't have to guess blindly.
-        Log::info('Gemini verification triggered', [
-            'has_key'    => !empty($apiKey),
-            'key_prefix' => $apiKey ? substr($apiKey, 0, 6) : null,
-            'category'   => $category,
-            'file_count' => count($files),
-        ]);
 
         if (!$apiKey) {
             return ['matches' => true, 'reason' => 'AI verification not configured.'];
@@ -429,9 +459,9 @@ class ReportController extends Controller
 
         try {
             $response = Http::timeout(30)
-    ->post(
-        "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={$apiKey}",
-        [
+                ->post(
+                    "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={$apiKey}",
+                    [
                         'contents' => [
                             ['parts' => $parts],
                         ],
@@ -441,13 +471,6 @@ class ReportController extends Controller
                         ],
                     ]
                 );
-
-            // TEMPORARY DEBUG LOGGING — logs the raw Gemini response so we can
-            // see exactly what came back before parsing it.
-            Log::info('Gemini raw response', [
-                'status' => $response->status(),
-                'body'   => $response->body(),
-            ]);
 
             if (!$response->successful()) {
                 Log::error('Gemini verification failed', [
@@ -486,6 +509,7 @@ class ReportController extends Controller
     {
         return [
             'id'            => $r->reference_code,
+            'reportId'      => $r->id,
             'title'         => $r->title,
             'location'      => $r->address,
             'status'        => $this->statusLabel($r->status),
@@ -512,6 +536,7 @@ class ReportController extends Controller
 
         return [
             'id'          => $r->reference_code,
+            'reportId'    => $r->id,
             'title'       => $r->title,
             'location'    => $r->address,
             'status'      => $this->statusLabel($r->status),

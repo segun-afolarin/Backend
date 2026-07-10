@@ -56,11 +56,15 @@ Route::middleware(['auth:sanctum'])->group(function () {
     Route::delete('/notifications/{id}',      [NotificationController::class, 'destroy']);
 
     // Reports — called by report-related pages (My Reports, Confirmed, Nearby, submission, confirmation)
+    // NOTE: /reports/stats must come before /reports/{report}/... routes so
+    // Laravel doesn't try to match "stats" as a {report} wildcard parameter.
+    Route::get('/reports/stats',               [ReportController::class, 'stats']);
     Route::get('/reports/mine',                [ReportController::class, 'mine']);
     Route::get('/reports/confirmed',           [ReportController::class, 'confirmed']);
     Route::get('/reports/nearby',              [ReportController::class, 'nearby']);
     Route::post('/reports',                    [ReportController::class, 'store']);
     Route::post('/reports/{report}/confirm',   [ReportController::class, 'confirm']);
+    Route::delete('/reports/{report}',         [ReportController::class, 'destroy']);
 
     // Returns the full fresh user object — called on every page load
     // by AuthContext to keep all components in sync with the database.
