@@ -228,8 +228,6 @@ class ReportController extends Controller
             'longitude'    => ['nullable', 'numeric', 'between:-180,180'],
             'images'       => ['required', 'array', 'min:1', 'max:3'],
             'images.*'     => ['image', 'mimes:jpg,jpeg,png,webp', 'max:5120'],
-            // Sent from the frontend as a string "true"/"false" via FormData —
-            // boolean rule with castable coerces that correctly.
             'is_emergency' => ['nullable', 'boolean'],
         ]);
 
@@ -343,9 +341,6 @@ class ReportController extends Controller
                     'evidence_path' => $path,
                 ]);
 
-                // Auto-progress status once required confirmations are met —
-                // required_confirmations is already set correctly per-report
-                // (3 for emergency, 5 for normal) at creation time in store().
                 $count = $report->confirmations()->count();
                 $newStatus = $count >= $report->required_confirmations
                     ? 'resolved'
@@ -385,6 +380,16 @@ class ReportController extends Controller
     private function verifyImagesMatchCategory(string $category, array $files): array
     {
         $apiKey = config('services.gemini.key');
+
+        // TEMPORARY DEBUG LOGGING — remove once verification is confirmed working.
+        // Tells us whether the key is reaching Laravel at all before we even
+        // attempt the API call, so we don't have to guess blindly.
+        Log::info('Gemini verification triggered', [
+            'has_key'    => !empty($apiKey),
+            'key_prefix' => $apiKey ? substr($apiKey, 0, 6) : null,
+            'category'   => $category,
+            'file_count' => count($files),
+        ]);
 
         if (!$apiKey) {
             return ['matches' => true, 'reason' => 'AI verification not configured.'];
@@ -436,6 +441,13 @@ class ReportController extends Controller
                         ],
                     ]
                 );
+
+            // TEMPORARY DEBUG LOGGING — logs the raw Gemini response so we can
+            // see exactly what came back before parsing it.
+            Log::info('Gemini raw response', [
+                'status' => $response->status(),
+                'body'   => $response->body(),
+            ]);
 
             if (!$response->successful()) {
                 Log::error('Gemini verification failed', [
