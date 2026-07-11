@@ -69,9 +69,12 @@ Route::middleware(['auth:sanctum'])->group(function () {
     Route::delete('/notifications/{id}',      [NotificationController::class, 'destroy']);
 
     // Reports — called by report-related pages (My Reports, Confirmed, Nearby, submission, confirmation)
-    // NOTE: /reports/stats must come before /reports/{report}/... routes so
-    // Laravel doesn't try to match "stats" as a {report} wildcard parameter.
+    // NOTE: /reports/stats and /reports/rank must come before /reports/{report}/...
+    // routes so Laravel doesn't try to match "stats"/"rank" as a {report}
+    // wildcard parameter — that mismatch is what produced a 405 instead of
+    // actually hitting the intended controller method.
     Route::get('/reports/stats',               [ReportController::class, 'stats']);
+    Route::get('/reports/rank',                [ReportController::class, 'rank']);
     Route::get('/reports/mine',                [ReportController::class, 'mine']);
     Route::get('/reports/confirmed',           [ReportController::class, 'confirmed']);
     Route::get('/reports/nearby',              [ReportController::class, 'nearby']);
