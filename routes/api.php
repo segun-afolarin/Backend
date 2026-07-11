@@ -3,6 +3,7 @@
 use App\Http\Controllers\Auth\LoginController;
 use App\Http\Controllers\Auth\LogoutController;
 use App\Http\Controllers\Auth\RegisterController;
+use App\Http\Controllers\HelpCenterChatController;
 use App\Http\Controllers\LocationController;
 use App\Http\Controllers\NotificationController;
 use App\Http\Controllers\ProfileController;
@@ -22,6 +23,12 @@ RateLimiter::for('auth', function (Request $request) {
     return Limit::perMinute(5)->by($request->ip());
 });
 
+// Public, unauthenticated AI chat — throttled per IP since anyone can reach
+// it without a token and each request costs a Gemini call.
+RateLimiter::for('help-center', function (Request $request) {
+    return Limit::perMinute(20)->by($request->ip());
+});
+
 /*
 |--------------------------------------------------------------------------
 | Public Routes — no token required
@@ -31,6 +38,12 @@ RateLimiter::for('auth', function (Request $request) {
 Route::middleware(['throttle:auth'])->group(function () {
     Route::post('/register', RegisterController::class);
     Route::post('/login',    LoginController::class);
+});
+
+// Help Center AI chat — public by design (visitors don't need an account
+// to ask how reporting works or to track a report by reference code + email).
+Route::middleware(['throttle:help-center'])->group(function () {
+    Route::post('/help-center/chat', [HelpCenterChatController::class, 'chat']);
 });
 
 /*

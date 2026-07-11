@@ -23,8 +23,16 @@ return [
         ],
     ],
 
+    // Used by ReportController for AI photo-verification on submitted reports.
     'gemini' => [
         'key' => env('GEMINI_API_KEY'),
+    ],
+
+    // Used by HelpCenterChatController for the public help-desk chat — kept
+    // as its own key/quota so a busy help center can't starve report photo
+    // verification (and vice versa).
+    'gemini_help_center' => [
+        'key' => env('GEMINI_HELP_CENTER_API_KEY'),
     ],
 
 ];
