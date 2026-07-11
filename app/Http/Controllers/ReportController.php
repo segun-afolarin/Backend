@@ -19,6 +19,83 @@ class ReportController extends Controller
     private const REQUIRED_CONFIRMATIONS_EMERGENCY = 3;
     private const REQUIRED_CONFIRMATIONS_NORMAL    = 5;
 
+    // Nation Aura Score weights — a design choice, not an extracted
+    // ground-truth value. Centralized here so the frontend never has to
+    // duplicate/guess this formula.
+    private const SCORE_PER_REPORT       = 15;
+    private const SCORE_PER_RESOLVED     = 40;
+    private const SCORE_PER_CONFIRMATION = 5;
+
+    /**
+     * This user's Nation Aura Score plus their real rank/percentile among
+     * every user nationwide who has submitted at least one report. Users
+     * with zero reports aren't part of the ranked pool (nothing to rank),
+     * and get rank/percentile back as null rather than a fabricated value.
+     * GET /api/reports/rank
+     */
+    public function rank(Request $request): JsonResponse
+    {
+        $user = $request->user();
+
+        // Per-user report + resolved counts, nationwide (not state-scoped —
+        // this is a personal achievement stat, not a regional one).
+        $reportCounts = DB::table('reports')
+            ->select(
+                'user_id',
+                DB::raw('COUNT(*) as total_reports'),
+                DB::raw("SUM(CASE WHEN status = 'resolved' THEN 1 ELSE 0 END) as resolved_count")
+            )
+            ->groupBy('user_id')
+            ->get();
+
+        // Confirmations received on reports authored by each user.
+        $confirmationsReceived = DB::table('report_confirmations')
+            ->join('reports', 'reports.id', '=', 'report_confirmations.report_id')
+            ->select('reports.user_id', DB::raw('COUNT(*) as confirmations_received'))
+            ->groupBy('reports.user_id')
+            ->pluck('confirmations_received', 'user_id');
+
+        $scores = [];
+        foreach ($reportCounts as $row) {
+            $confirmations = (int) ($confirmationsReceived[$row->user_id] ?? 0);
+            $scores[$row->user_id] =
+                ((int) $row->total_reports) * self::SCORE_PER_REPORT
+                + ((int) $row->resolved_count) * self::SCORE_PER_RESOLVED
+                + $confirmations * self::SCORE_PER_CONFIRMATION;
+        }
+
+        $totalContributors = count($scores);
+
+        if (!array_key_exists($user->id, $scores) || $totalContributors === 0) {
+            // No reports submitted yet — nothing to rank.
+            return response()->json([
+                'score'             => 0,
+                'rank'              => null,
+                'totalContributors' => $totalContributors,
+                'topPercent'        => null,
+            ]);
+        }
+
+        arsort($scores); // highest score first, preserves user_id keys
+
+        $rank = 0;
+        foreach (array_keys($scores) as $position => $uid) {
+            if ($uid === $user->id) {
+                $rank = $position + 1;
+                break;
+            }
+        }
+
+        $topPercent = max(1, (int) ceil(($rank / $totalContributors) * 100));
+
+        return response()->json([
+            'score'             => $scores[$user->id],
+            'rank'              => $rank,
+            'totalContributors' => $totalContributors,
+            'topPercent'        => $topPercent,
+        ]);
+    }
+
     /**
      * Aggregate, state-scoped dashboard stats.
      * GET /api/reports/stats
