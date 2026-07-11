@@ -26,13 +26,15 @@ class Report extends Model
         'ai_score',
         'images',
         'required_confirmations',
+        'is_emergency',
     ];
 
     protected $casts = [
-        'images'    => 'array',
-        'latitude'  => 'float',
-        'longitude' => 'float',
-        'ai_score'  => 'integer',
+        'images'       => 'array',
+        'latitude'     => 'float',
+        'longitude'    => 'float',
+        'ai_score'     => 'integer',
+        'is_emergency' => 'boolean',
     ];
 
     // ── Relationships ────────────────────────────────────────────────────
