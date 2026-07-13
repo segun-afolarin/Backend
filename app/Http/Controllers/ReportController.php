@@ -592,11 +592,19 @@ class ReportController extends Controller
             'status'        => $this->statusLabel($r->status),
             'date'          => $r->created_at->format('d F Y'),
             'createdAt'     => $r->created_at->toIso8601String(),
+            // Real last-modified timestamp — used as the honest "resolved on"
+            // date for resolved reports. Not a dedicated resolution-event
+            // timestamp (no status-history table exists), but for a report
+            // that's already resolved, updated_at reflects when that happened.
+            'updatedAt'     => $r->updated_at->toIso8601String(),
             'score'         => $r->ai_score . '%',
             'confirmations' => $r->confirmations_count ?? $r->confirmations()->count(),
             'requiredConfirmations' => $r->required_confirmations,
             'isEmergency'   => (bool) $r->is_emergency,
             'image'         => $r->image_urls[0] ?? null,
+            // Full evidence gallery (up to 3 images per submission), for
+            // components that show more than just a single thumbnail.
+            'images'        => $r->image_urls ?? [],
             'description'   => $r->description,
             'fields'        => $this->deriveFields($r),
             'updates'       => $this->deriveUpdates($r->status),
