@@ -67,12 +67,16 @@ class ReportController extends Controller
         $totalContributors = count($scores);
 
         if (!array_key_exists($user->id, $scores) || $totalContributors === 0) {
-            // No reports submitted yet — nothing to rank.
+            // No reports submitted yet — nothing to rank, nationwide or state.
             return response()->json([
-                'score'             => 0,
-                'rank'              => null,
-                'totalContributors' => $totalContributors,
-                'topPercent'        => null,
+                'score'                  => 0,
+                'rank'                   => null,
+                'totalContributors'      => $totalContributors,
+                'topPercent'             => null,
+                'state'                  => $user->state,
+                'stateRank'              => null,
+                'stateTotalContributors' => 0,
+                'stateTopPercent'        => null,
             ]);
         }
 
@@ -88,11 +92,43 @@ class ReportController extends Controller
 
         $topPercent = max(1, (int) ceil(($rank / $totalContributors) * 100));
 
+        // ── State-scoped ranking pass — same scores, filtered to only the
+        // users who share this user's state. Requires a state column on
+        // `users` (same one used everywhere else, e.g. Report::inState()).
+        $stateRank = null;
+        $stateTotalContributors = 0;
+        $stateTopPercent = null;
+
+        if ($user->state) {
+            $userIdsInState = DB::table('users')
+                ->where('state', $user->state)
+                ->pluck('id')
+                ->all();
+
+            $stateScores = array_intersect_key($scores, array_flip($userIdsInState));
+            $stateTotalContributors = count($stateScores);
+
+            if (array_key_exists($user->id, $stateScores) && $stateTotalContributors > 0) {
+                arsort($stateScores);
+                foreach (array_keys($stateScores) as $position => $uid) {
+                    if ($uid === $user->id) {
+                        $stateRank = $position + 1;
+                        break;
+                    }
+                }
+                $stateTopPercent = max(1, (int) ceil(($stateRank / $stateTotalContributors) * 100));
+            }
+        }
+
         return response()->json([
-            'score'             => $scores[$user->id],
-            'rank'              => $rank,
-            'totalContributors' => $totalContributors,
-            'topPercent'        => $topPercent,
+            'score'                  => $scores[$user->id],
+            'rank'                   => $rank,
+            'totalContributors'      => $totalContributors,
+            'topPercent'             => $topPercent,
+            'state'                  => $user->state,
+            'stateRank'              => $stateRank,
+            'stateTotalContributors' => $stateTotalContributors,
+            'stateTopPercent'        => $stateTopPercent,
         ]);
     }
 
