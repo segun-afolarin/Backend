@@ -77,6 +77,8 @@ class ReportController extends Controller
                 'stateRank'              => null,
                 'stateTotalContributors' => 0,
                 'stateTopPercent'        => null,
+                'nextMilestoneRank'      => null,
+                'milestoneProgress'      => null,
             ]);
         }
 
@@ -120,6 +122,35 @@ class ReportController extends Controller
             }
         }
 
+        // ── Real "next milestone" — picks the next achievable rank tier
+        // (Top 1000/500/250/100/50/10/1) below the user's current rank, and
+        // looks up the ACTUAL score of whoever currently holds that tier
+        // position, so "72% progress" means something real: how close this
+        // user's score is to the score needed to break into that tier.
+        // $scores is already sorted descending (arsort above), so position
+        // N-1 in the values list is literally the Nth-ranked score.
+        $milestoneTiers = [1, 10, 50, 100, 250, 500, 1000];
+        $sortedScoreValues = array_values($scores);
+
+        $nextMilestoneRank = null;
+        $nextMilestoneScore = null;
+        $milestoneProgress = null;
+
+        foreach ($milestoneTiers as $tier) {
+            if ($tier < $rank && $tier <= $totalContributors) {
+                $nextMilestoneRank = $tier;
+                $nextMilestoneScore = $sortedScoreValues[$tier - 1] ?? null;
+            }
+        }
+        // The loop above keeps the LAST (largest) tier below $rank, i.e. the
+        // easiest/nearest not-yet-reached milestone.
+
+        if ($nextMilestoneScore !== null && $nextMilestoneScore > 0) {
+            $milestoneProgress = min(100, (int) round(($scores[$user->id] / $nextMilestoneScore) * 100));
+        } elseif ($rank <= 1) {
+            $milestoneProgress = 100; // already #1, nothing left to chase
+        }
+
         return response()->json([
             'score'                  => $scores[$user->id],
             'rank'                   => $rank,
@@ -129,6 +160,8 @@ class ReportController extends Controller
             'stateRank'              => $stateRank,
             'stateTotalContributors' => $stateTotalContributors,
             'stateTopPercent'        => $stateTopPercent,
+            'nextMilestoneRank'      => $nextMilestoneRank,
+            'milestoneProgress'      => $milestoneProgress,
         ]);
     }
 
@@ -268,8 +301,24 @@ class ReportController extends Controller
             ->orderByDesc('created_at')
             ->get();
 
+        // Month-over-month confirmations received on this user's own reports —
+        // there's no per-report-confirmation-date field exposed elsewhere, so
+        // this is computed here directly from report_confirmations.created_at.
+        $monthAgo = now()->subDays(30);
+        $twoMonthsAgo = now()->subDays(60);
+
+        $confirmationsThisMonth = ReportConfirmation::whereHas('report', function ($q) use ($user) {
+            $q->where('user_id', $user->id);
+        })->where('created_at', '>=', $monthAgo)->count();
+
+        $confirmationsLastMonth = ReportConfirmation::whereHas('report', function ($q) use ($user) {
+            $q->where('user_id', $user->id);
+        })->whereBetween('created_at', [$twoMonthsAgo, $monthAgo])->count();
+
         return response()->json([
-            'reports' => $reports->map(fn (Report $r) => $this->transformOwnReport($r)),
+            'reports'                 => $reports->map(fn (Report $r) => $this->transformOwnReport($r)),
+            'confirmationsThisMonth'  => $confirmationsThisMonth,
+            'confirmationsLastMonth'  => $confirmationsLastMonth,
         ]);
     }
 
@@ -529,12 +578,22 @@ class ReportController extends Controller
      * match the selected incident category. Fails "open" (allows the
      * report through) if the API key is missing or Gemini is unreachable,
      * so a billing/outage issue never blocks legitimate emergency reports.
+     *
+     * NOTE: Google has been retiring Gemini model IDs early and without
+     * much warning (gemini-2.5-flash stopped responding well before its
+     * announced Oct 2026 deprecation date, silently disabling verification
+     * here since fail-open swallows the error). If verification appears to
+     * stop working again — every photo getting accepted regardless of
+     * content — check the logs for "Gemini verification failed" first;
+     * that almost always means the model string below needs updating to
+     * whatever Google's current GA model is at https://ai.google.dev/gemini-api/docs/models.
      */
     private function verifyImagesMatchCategory(string $category, array $files): array
     {
         $apiKey = config('services.gemini.key');
 
         if (!$apiKey) {
+            Log::warning('Gemini API key not configured — AI verification skipped, report allowed through.');
             return ['matches' => true, 'reason' => 'AI verification not configured.'];
         }
 
@@ -573,7 +632,7 @@ class ReportController extends Controller
         try {
             $response = Http::timeout(30)
                 ->post(
-                    "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={$apiKey}",
+                    "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent?key={$apiKey}",
                     [
                         'contents' => [
                             ['parts' => $parts],
