@@ -26,6 +26,19 @@ class ReportController extends Controller
     private const SCORE_PER_RESOLVED     = 40;
     private const SCORE_PER_CONFIRMATION = 5;
 
+    // Gemini model used for AI photo-verification. Kept as one constant so
+    // there's only one place to update if/when Google retires this model ID
+    // — see the note above verifyImagesMatchCategory() below.
+    private const GEMINI_MODEL = 'gemini-2.5-flash';
+
+    // How many times a user can fail AI photo-verification before we make
+    // them wait — closes the "keep resubmitting the same mismatched photo
+    // until the AI happens to approve it" loophole caused by inherent LLM
+    // response variance. Counter is per-user, not per-category, so
+    // switching category doesn't reset it.
+    private const MAX_FAILED_AI_ATTEMPTS = 3;
+    private const FAILED_AI_ATTEMPTS_COOLDOWN_MINUTES = 15;
+
     /**
      * This user's Nation Aura Score plus their real rank/percentile among
      * every user nationwide who has submitted at least one report. Users
@@ -173,6 +186,16 @@ class ReportController extends Controller
     {
         $user = $request->user();
 
+        // AI Accuracy is computed system-wide (not state-scoped) since it
+        // measures the AI model's real judgment quality, not regional
+        // activity — a single state may not have enough logged checks to be
+        // a meaningful percentage on its own. aiVerificationCount tells the
+        // frontend how many real checks the percentage is based on, so a
+        // very small sample can be treated differently if desired.
+        $aiTotal  = DB::table('ai_verifications')->count();
+        $aiPassed = DB::table('ai_verifications')->where('matches', true)->count();
+        $aiAccuracy = $aiTotal > 0 ? round(($aiPassed / $aiTotal) * 100) : null;
+
         if (!$user->state) {
             return response()->json([
                 'state'                => null,
@@ -194,6 +217,8 @@ class ReportController extends Controller
                 'topCategory'          => null,
                 'todayTotal'           => 0,
                 'todayByCategory'      => (object) [],
+                'aiAccuracy'           => $aiAccuracy,
+                'aiVerificationCount'  => $aiTotal,
             ]);
         }
 
@@ -272,6 +297,8 @@ class ReportController extends Controller
             'topCategory'          => $topCategory,
             'todayTotal'           => $todayTotal,
             'todayByCategory'      => $todayByCategory,
+            'aiAccuracy'           => $aiAccuracy,
+            'aiVerificationCount'  => $aiTotal,
         ]);
     }
 
@@ -395,16 +422,36 @@ class ReportController extends Controller
 
         $isEmergency = filter_var($request->input('is_emergency', false), FILTER_VALIDATE_BOOLEAN);
 
+        // ── Block repeated retries after too many AI rejections ──
+        // Prevents "keep resubmitting the same mismatched photo until the
+        // AI happens to approve it" — checked BEFORE calling Gemini again,
+        // so a user in cooldown doesn't even get another roll of the dice.
+        if ($this->tooManyFailedAiAttempts($user->id)) {
+            return response()->json([
+                'message' => "You've had several photo verifications rejected recently. "
+                    . 'Please wait ' . self::FAILED_AI_ATTEMPTS_COOLDOWN_MINUTES . ' minutes before trying again, '
+                    . 'or upload a clearer, genuinely matching photo.',
+                'ai_mismatch' => true,
+            ], 429);
+        }
+
         // ── AI verification: does the photo evidence match the selected category? ──
         $verification = $this->verifyImagesMatchCategory($validated['category'], $request->file('images'));
 
+        if ($verification['ai_ran'] ?? false) {
+            $this->logAiVerification($user->id, 'report_submission', $validated['category'], $verification);
+        }
+
         if (!$verification['matches']) {
+            $this->recordFailedAiAttempt($user->id);
             return response()->json([
                 'message'     => $verification['reason']
                     ?: "The uploaded photo(s) don't appear to match \"{$validated['category']}\". Please upload a clearer photo of the actual incident.",
                 'ai_mismatch' => true,
             ], 422);
         }
+
+        $this->clearFailedAiAttempts($user->id);
 
         try {
             $report = DB::transaction(function () use ($request, $user, $validated, $isEmergency) {
@@ -478,16 +525,34 @@ class ReportController extends Controller
             return response()->json(['message' => 'You already confirmed this report.'], 409);
         }
 
+        // ── Block repeated retries after too many AI rejections (same
+        // cooldown pool as report submission — see store()) ──
+        if ($this->tooManyFailedAiAttempts($user->id)) {
+            return response()->json([
+                'message' => "You've had several photo verifications rejected recently. "
+                    . 'Please wait ' . self::FAILED_AI_ATTEMPTS_COOLDOWN_MINUTES . ' minutes before trying again, '
+                    . 'or upload a clearer, genuinely matching photo.',
+                'ai_mismatch' => true,
+            ], 429);
+        }
+
         // ── AI verification for confirmation evidence too ──
         $verification = $this->verifyImagesMatchCategory($report->category, [$request->file('evidence')]);
 
+        if ($verification['ai_ran'] ?? false) {
+            $this->logAiVerification($user->id, 'report_confirmation', $report->category, $verification);
+        }
+
         if (!$verification['matches']) {
+            $this->recordFailedAiAttempt($user->id);
             return response()->json([
                 'message'     => $verification['reason']
                     ?: "The uploaded photo doesn't appear to match this report's category (\"{$report->category}\"). Please upload clearer evidence.",
                 'ai_mismatch' => true,
             ], 422);
         }
+
+        $this->clearFailedAiAttempts($user->id);
 
         try {
             $confirmation = DB::transaction(function () use ($request, $report, $user) {
@@ -580,13 +645,11 @@ class ReportController extends Controller
      * so a billing/outage issue never blocks legitimate emergency reports.
      *
      * NOTE: Google has been retiring Gemini model IDs early and without
-     * much warning (gemini-2.5-flash stopped responding well before its
-     * announced Oct 2026 deprecation date, silently disabling verification
-     * here since fail-open swallows the error). If verification appears to
-     * stop working again — every photo getting accepted regardless of
-     * content — check the logs for "Gemini verification failed" first;
-     * that almost always means the model string below needs updating to
-     * whatever Google's current GA model is at https://ai.google.dev/gemini-api/docs/models.
+     * much warning. If verification appears to stop working — every photo
+     * getting accepted regardless of content — check the logs for "Gemini
+     * verification failed" first; that almost always means self::GEMINI_MODEL
+     * below needs updating to whatever Google's current GA model is at
+     * https://ai.google.dev/gemini-api/docs/models.
      */
     private function verifyImagesMatchCategory(string $category, array $files): array
     {
@@ -594,7 +657,7 @@ class ReportController extends Controller
 
         if (!$apiKey) {
             Log::warning('Gemini API key not configured — AI verification skipped, report allowed through.');
-            return ['matches' => true, 'reason' => 'AI verification not configured.'];
+            return ['matches' => true, 'reason' => 'AI verification not configured.', 'ai_ran' => false];
         }
 
         $imageParts = [];
@@ -613,17 +676,19 @@ class ReportController extends Controller
         }
 
         if (empty($imageParts)) {
-            return ['matches' => true, 'reason' => 'No images to verify.'];
+            return ['matches' => true, 'reason' => 'No images to verify.', 'ai_ran' => false];
         }
 
         $prompt = "You are verifying a civic incident report submitted in Nigeria. "
             . "The reporter selected this incident category: \"{$category}\". "
-            . "Look at the attached photo(s) and judge whether they plausibly show "
+            . "Look at the attached photo(s) and judge whether they clearly show "
             . "evidence of this type of incident (categories include: Flooding, Bad Roads, "
             . "Drain Blockage, Power Failure, Fire Outbreak, Accident). "
-            . "Be reasonably lenient — approve if the photo could plausibly relate to the category, "
-            . "even if not perfectly clear. Only reject if the photo is obviously unrelated "
-            . "(e.g. a selfie, a meme, a completely different scene). "
+            . "Give a confident, consistent judgment — if you were shown this exact same "
+            . "photo again, you should reach the same conclusion every time. "
+            . "Approve only if the photo genuinely and clearly depicts the selected category. "
+            . "Reject if the photo is unrelated, ambiguous, too unclear to tell, or only "
+            . "loosely/coincidentally connected to the category. "
             . "Respond ONLY with strict JSON, no other text, no markdown: "
             . '{"matches": true or false, "reason": "short one-sentence explanation a citizen would understand"}';
 
@@ -632,14 +697,14 @@ class ReportController extends Controller
         try {
             $response = Http::timeout(30)
                 ->post(
-                    "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent?key={$apiKey}",
+                    'https://generativelanguage.googleapis.com/v1beta/models/' . self::GEMINI_MODEL . ':generateContent?key=' . $apiKey,
                     [
                         'contents' => [
                             ['parts' => $parts],
                         ],
                         'generationConfig' => [
                             'maxOutputTokens' => 200,
-                            'temperature'     => 0.2,
+                            'temperature'     => 0,
                         ],
                     ]
                 );
@@ -649,7 +714,7 @@ class ReportController extends Controller
                     'status' => $response->status(),
                     'body'   => $response->body(),
                 ]);
-                return ['matches' => true, 'reason' => 'AI verification unavailable.'];
+                return ['matches' => true, 'reason' => 'AI verification unavailable.', 'ai_ran' => false];
             }
 
             $content = $response->json('candidates.0.content.parts.0.text');
@@ -661,18 +726,68 @@ class ReportController extends Controller
 
             if (!is_array($parsed)) {
                 Log::warning('Could not parse Gemini response', ['content' => $content]);
-                return ['matches' => true, 'reason' => 'Could not parse AI response.'];
+                return ['matches' => true, 'reason' => 'Could not parse AI response.', 'ai_ran' => false];
             }
 
+            // This is the one path where Gemini actually ran and gave a real
+            // judgment — the only kind of result that belongs in the
+            // ai_verifications log used to compute AI Accuracy.
             return [
                 'matches' => (bool) ($parsed['matches'] ?? true),
                 'reason'  => $parsed['reason'] ?? '',
+                'ai_ran'  => true,
             ];
 
         } catch (\Throwable $e) {
             Log::error('Gemini request threw exception', ['message' => $e->getMessage()]);
-            return ['matches' => true, 'reason' => 'AI verification unavailable.'];
+            return ['matches' => true, 'reason' => 'AI verification unavailable.', 'ai_ran' => false];
         }
+    }
+
+    /**
+     * Logs a real AI verification result (only ever called when
+     * verifyImagesMatchCategory() actually got a judgment from Gemini —
+     * see the ai_ran flag). Used to compute honest "AI Accuracy" stats.
+     */
+    private function logAiVerification(int $userId, string $context, string $category, array $verification): void
+    {
+        try {
+            DB::table('ai_verifications')->insert([
+                'user_id'    => $userId,
+                'context'    => $context,
+                'category'   => $category,
+                'matches'    => $verification['matches'],
+                'reason'     => $verification['reason'] ?? null,
+                'created_at' => now(),
+                'updated_at' => now(),
+            ]);
+        } catch (\Throwable $e) {
+            // Logging must never break the actual report/confirmation flow.
+            Log::error('Failed to log AI verification result', ['message' => $e->getMessage()]);
+        }
+    }
+
+    /** Cache key for a user's rolling count of failed AI verifications. */
+    private function failedAiAttemptsCacheKey(int $userId): string
+    {
+        return "ai_failed_attempts:{$userId}";
+    }
+
+    private function tooManyFailedAiAttempts(int $userId): bool
+    {
+        return (int) cache()->get($this->failedAiAttemptsCacheKey($userId), 0) >= self::MAX_FAILED_AI_ATTEMPTS;
+    }
+
+    private function recordFailedAiAttempt(int $userId): void
+    {
+        $key = $this->failedAiAttemptsCacheKey($userId);
+        $current = (int) cache()->get($key, 0);
+        cache()->put($key, $current + 1, now()->addMinutes(self::FAILED_AI_ATTEMPTS_COOLDOWN_MINUTES));
+    }
+
+    private function clearFailedAiAttempts(int $userId): void
+    {
+        cache()->forget($this->failedAiAttemptsCacheKey($userId));
     }
 
     // ── Transformers ──────────────────────────────────────────────────────
@@ -798,6 +913,3 @@ class ReportController extends Controller
         };
     }
 }
-
-
-
